@@ -1,7 +1,7 @@
 class MeshNode {
   final String mac;
   final int layer;
-  final String parent;
+  final String parent; // empty string when not provided by source
   final int? rssi;
   final bool acked;
   final bool missing;
@@ -17,11 +17,14 @@ class MeshNode {
 
   factory MeshNode.fromJson(Map<String, dynamic> json) => MeshNode(
         mac: json['mac'] as String,
-        layer: json['layer'] as int,
-        parent: json['parent'] as String,
+        // Serial sends "layer", MQTT sends "level" — accept both
+        layer: (json['layer'] ?? json['level'] ?? 1) as int,
+        // MQTT format has no parent field
+        parent: (json['parent'] as String?) ?? '',
         rssi: json['rssi'] as int?,
-        acked: json['acked'] as bool,
-        missing: json['missing'] as bool? ?? false,
+        // MQTT format has no acked field per node — default true
+        acked: (json['acked'] as bool?) ?? true,
+        missing: (json['missing'] as bool?) ?? false,
       );
 
   String get shortMac {

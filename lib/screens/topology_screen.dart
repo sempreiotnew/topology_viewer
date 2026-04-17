@@ -4,8 +4,10 @@ import 'dart:math';
 import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:usb_serial/usb_serial.dart';
+import '../app_constants.dart';
 import '../models/topology_data.dart';
 import '../models/data_pulse.dart';
+import '../services/mqtt_service.dart';
 import '../widgets/node_widget.dart';
 import '../widgets/grid_painter.dart';
 import '../widgets/edge_painter.dart';
@@ -24,7 +26,7 @@ class TopologyScreen extends StatefulWidget {
 
 class _TopologyScreenState extends State<TopologyScreen>
     with TickerProviderStateMixin {
-  // Serial
+  // Serial (only used when kCentral = true)
   UsbPort? _port;
   StreamSubscription<UsbEvent>? _usbEventSub;
   StreamSubscription<Uint8List>? _dataSub;
@@ -36,6 +38,17 @@ class _TopologyScreenState extends State<TopologyScreen>
   static const Duration _watchdogTimeout = Duration(seconds: 8);
   Timer? _watchdogTimer;
   DateTime? _lastDataAt;
+
+  // MQTT
+  MqttService? _mqttService;
+  StreamSubscription<String>? _mqttMessageSub;
+  bool _mqttConnected = false;
+
+  // Deduplication — when kCentral=true both serial and MQTT may deliver the
+  // same topology packet; we drop duplicates by tracking the last N seq numbers.
+  static const int _maxSeenSeqs = 50;
+  final Set<int> _seenSeqs = {};
+  final List<int> _seenSeqOrder = [];
 
   // Topology
   TopologyData? _topology;
@@ -70,7 +83,13 @@ class _TopologyScreenState extends State<TopologyScreen>
   @override
   void initState() {
     super.initState();
-    _initUsb();
+    // Serial is only available in CENTRAL mode
+    if (kCentral) {
+      _initUsb();
+    } else {
+      _statusMsg = 'MQTT connecting…';
+    }
+    _initMqtt();
   }
 
   @override
@@ -84,6 +103,8 @@ class _TopologyScreenState extends State<TopologyScreen>
     _pulseTimers.clear();
     for (final p in _pulses) p.controller.dispose();
     _pulseRepaint.dispose();
+    _mqttMessageSub?.cancel();
+    _mqttService?.disconnect();
     super.dispose();
   }
 
@@ -275,11 +296,39 @@ class _TopologyScreenState extends State<TopologyScreen>
     });
   }
 
+  // ── MQTT ─────────────────────────────────────────────────────────────────────
+
+  Future<void> _initMqtt() async {
+    _mqttService = MqttService();
+    _mqttService!.connected.addListener(_onMqttConnectionChanged);
+    _mqttMessageSub = _mqttService!.messages.listen(_tryParseLine);
+    await _mqttService!.connect();
+  }
+
+  void _onMqttConnectionChanged() {
+    if (!mounted) return;
+    final isConnected = _mqttService!.connected.value;
+    setState(() {
+      _mqttConnected = isConnected;
+      // In MOBILE mode (kCentral=false) the MQTT connection IS the main indicator
+      if (!kCentral) {
+        _connected = isConnected;
+        _statusMsg = isConnected ? 'MQTT connected' : 'MQTT connecting…';
+      }
+    });
+  }
+
+  // ── JSON parsing + deduplication ─────────────────────────────────────────────
+
   void _tryParseLine(String line) {
     try {
       final decoded = jsonDecode(line);
-      if (decoded is! Map<String, dynamic>) return;
-      // Handle ALARM messages
+      if (decoded is! Map<String, dynamic>) {
+        debugPrint('[PARSE] dropped — not a JSON object: ${line.length}B');
+        return;
+      }
+
+      // Handle ALARM messages — idempotent, no dedup needed
       if (decoded['type'] == 'ALARM') {
         final mac = (decoded['mac'] as String?)?.toLowerCase();
         final isAlarm = decoded['is_alarm'] == true;
@@ -288,8 +337,34 @@ class _TopologyScreenState extends State<TopologyScreen>
         }
         return;
       }
-      if (!decoded.containsKey('root') || !decoded.containsKey('nodes')) return;
+
+      // Must contain nodes to be a topology packet
+      // (Serial also has "root"; MQTT format omits it — TopologyData.fromJson
+      //  derives a root from the nodes list when the field is missing.)
+      if (!decoded.containsKey('nodes')) {
+        debugPrint('[PARSE] dropped — no "nodes" key. keys=${decoded.keys.toList()}');
+        return;
+      }
+
+      // Deduplicate topology packets by seq — when kCentral=true both serial
+      // and MQTT may deliver the same packet; we keep only the first arrival.
+      final seq = decoded['seq'] as int?;
+      if (seq != null) {
+        if (_seenSeqs.contains(seq)) {
+          debugPrint('[PARSE] dropped — duplicate seq=$seq');
+          return;
+        }
+        _seenSeqs.add(seq);
+        _seenSeqOrder.add(seq);
+        if (_seenSeqOrder.length > _maxSeenSeqs) {
+          _seenSeqs.remove(_seenSeqOrder.removeAt(0));
+        }
+      }
+
+      debugPrint('[PARSE] accepted — seq=$seq  keys=${decoded.keys.toList()}');
       final topo = TopologyData.fromJson(decoded);
+      debugPrint('[PARSE] built TopologyData — root:${topo.root}  nodes:${topo.nodes.length}');
+
       if (!mounted) return;
       final isFirst = _topology == null;
       setState(() {
@@ -300,7 +375,7 @@ class _TopologyScreenState extends State<TopologyScreen>
       });
       _triggerPulseAnimation(topo);
     } catch (e, st) {
-      debugPrint('_tryParseLine error: $e\n$st');
+      debugPrint('[PARSE] exception: $e\n$st');
     }
   }
 
@@ -494,6 +569,9 @@ class _TopologyScreenState extends State<TopologyScreen>
             connected: _connected,
             statusMsg: _statusMsg,
             topology: _topology,
+            // In CENTRAL mode show a separate MQTT dot alongside serial status.
+            // In MOBILE mode the main dot already represents MQTT — no extra dot.
+            mqttConnected: kCentral ? _mqttConnected : null,
           ),
           Expanded(child: _buildTopologyView()),
           const TopologyFooter(),
